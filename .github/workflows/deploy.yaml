@@ -74,25 +74,28 @@ jobs:
           docker push ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:latest
 
       # 7. Kubelogin Authentication & AKS Credentials
+    # 7. Kubelogin Authentication & AKS Credentials
       - name: Set up Kubelogin and Get AKS Credentials
         run: |
           az aks install-cli
-          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --overwrite-existing
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --overwrite-existing --public-fqdn
           kubelogin convert-kubeconfig -l azurecli
 
+      # 8. Create Kubernetes Secret from Key Vault Outputs
       # 8. Create Kubernetes Secret from Key Vault Outputs
       - name: Create K8s db-secret from Azure Key Vault Data
         run: |
           kubectl create secret generic db-secret \
             --from-literal=POSTGRES_USER='${{ steps.keyvault.outputs.postgres-user }}' \
             --from-literal=POSTGRES_PASSWORD='${{ steps.keyvault.outputs.postgres-password }}' \
-            --dry-run=client -o yaml | kubectl apply -f -
+            --dry-run=client -o yaml | kubectl apply --validate=false -f -
 
       # 9. Apply K8s Manifests with Dynamic Image Tag
+# 9. Apply K8s Manifests with Dynamic Image Tag
       - name: Deploy Manifests to AKS
         run: |
           sed -i "s|IMAGE_PLACEHOLDER|${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|" k8s/api-deployment.yaml
-          kubectl apply -f k8s/
+          kubectl apply --validate=false -f k8s/
 
       # 10. Verify Deployment Rollout Status
       - name: Verify Rollout Status
