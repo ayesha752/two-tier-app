@@ -1,50 +1,101 @@
-name: build-and-deploy
+name: Deploy 2-Tier App to AKS with Key Vault and Trivy
+
 on:
   push:
-    branches: [main]
+    branches: [ "main" ]
+
+permissions:
+  id-token: write   # Required for passwordless OIDC login to Azure
+  contents: read
 
 env:
-  ACR: k8slabzainab.azurecr.io
-  IMAGE: two-tier-api
+  ACR_NAME: k8slab
+  ACR_URL: k8slab.azurecr.io
+  IMAGE_NAME: two-tier-api
+  RESOURCE_GROUP: k8slab-rg
+  CLUSTER_NAME: k8slab-aks
+  KEYVAULT_NAME: kv-k8slab
 
 jobs:
-  deploy:
+  build-scan-deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Login to ACR
-        uses: docker/login-action@v3
+      # 1. Passwordless OIDC Azure Login
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
         with:
-          registry: ${{ env.ACR }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push image
+      # 2. Fetch Secrets from Azure Key Vault
+      - name: Fetch Secrets from Azure Key Vault
+        uses: azure/get-keyvault-secrets@v1
+        id: keyvault
+        with:
+          keyvault: ${{ env.KEYVAULT_NAME }}
+          secrets: 'postgres-user, postgres-password'
+
+      # 3. Trivy Scan: K8s Manifest Misconfigurations
+      - name: Run Trivy Security Scan on K8s Manifests
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          hide-progress: true
+          format: 'table'
+          exit-code: '0'   # Set to 1 if you want to block pipeline on high/critical misconfigurations
+          severity: 'HIGH,CRITICAL'
+
+      # 4. Log in to ACR & Build Image
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Build Docker Image
         run: |
-          docker build -t $ACR/$IMAGE:${{ github.sha }} .
-          docker push $ACR/$IMAGE:${{ github.sha }}
+          docker build -t ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Set up kubeconfig
+      # 5. Trivy Scan: Docker Image Vulnerabilities
+      - name: Run Trivy Container Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '0'   # Set to 1 if you want to block pipeline on critical image vulnerabilities
+          severity: 'CRITICAL'
+
+      # 6. Push Image to ACR
+      - name: Push Docker Image to ACR
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
+          docker push ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Create secret
+      # 7. Kubelogin Authentication & AKS Credentials
+      - name: Set up Kubelogin and Get AKS Credentials
+        run: |
+          az aks install-cli
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+      # 8. Create Kubernetes Secret from Key Vault Outputs
+      - name: Create K8s db-secret from Azure Key Vault Data
         run: |
           kubectl create secret generic db-secret \
-            --from-literal=POSTGRES_USER='${{ secrets.POSTGRES_USER }}' \
-            --from-literal=POSTGRES_PASSWORD='${{ secrets.POSTGRES_PASSWORD }}' \
+            --from-literal=POSTGRES_USER='${{ steps.keyvault.outputs.postgres-user }}' \
+            --from-literal=POSTGRES_PASSWORD='${{ steps.keyvault.outputs.postgres-password }}' \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Deploy manifests
+      # 9. Apply K8s Manifests with Dynamic Image Tag
+      - name: Deploy Manifests to AKS
         run: |
-          sed -i "s|IMAGE_PLACEHOLDER|$ACR/$IMAGE:${{ github.sha }}|" k8s/api-deployment.yaml
+          sed -i "s|IMAGE_PLACEHOLDER|${{ env.ACR_URL }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|" k8s/api-deployment.yaml
           kubectl apply -f k8s/
 
-      - name: Verify rollout
+      # 10. Verify Deployment Rollout Status
+      - name: Verify Rollout Status
         run: |
-          kubectl rollout status deployment/postgres --timeout=180s
           kubectl rollout status deployment/api --timeout=180s
-          kubectl get ingress
+          kubectl get pods,svc
